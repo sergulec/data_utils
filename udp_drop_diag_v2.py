@@ -5,6 +5,8 @@ from datetime import datetime
 from pathlib import Path
 
 DEFAULT_ISOLATED_THREAD_REGEX = r"udp_recv"
+EXANIC_TOOLS = ["exanic-config","exanic-capture","exanic-clock-sync","exanic-experf","exanic-fwupdate","exanic-fwversion","exanic-port-config"]
+ONLOAD_TOOLS = ["onload_stackdump","onload_tool","onload_info","onload_tcpdump"]
 
 def run(cmd: str) -> str:
     try:
@@ -45,12 +47,32 @@ def infer_rx_path(iface: str, requested: str, driver: str) -> str:
         return "onload"
     return "kernel"
 
-def collect(sample_dir: Path, iface: str, pid, port, group, src_ip, do_tcpdump: bool, tcpdump_count: int):
+def collect_vendor_tools(sample_dir: Path, rx_path: str, iface: str, do_tcpdump: bool, tcpdump_count: int):
+    vendor_cmds = {}
+    if rx_path == "exanic":
+        vendor_cmds["exanic_tools_present.txt"] = "bash -lc 'for c in " + " ".join(EXANIC_TOOLS) + "; do printf \"%s: \" \"$c\"; command -v \"$c\" || true; done'"
+        vendor_cmds["exanic_config.txt"] = "exanic-config 2>&1 || true"
+        vendor_cmds["exanic_tool_help.txt"] = "bash -lc 'for c in " + " ".join(EXANIC_TOOLS) + "; do if command -v \"$c\" >/dev/null 2>&1; then echo \"===== $c =====\"; \"$c\" --help 2>&1 | head -n 40; fi; done'"
+        if do_tcpdump:
+            vendor_cmds["exanic_capture_snapshot.txt"] = f"bash -lc 'if command -v exanic-capture >/dev/null 2>&1; then exanic-capture {shlex.quote(iface)} 2>&1 | head -n {int(tcpdump_count)}; else echo exanic-capture not found; fi'"
+    if rx_path == "onload":
+        vendor_cmds["onload_tools_present.txt"] = "bash -lc 'for c in " + " ".join(ONLOAD_TOOLS) + "; do printf \"%s: \" \"$c\"; command -v \"$c\" || true; done'"
+        vendor_cmds["onload_tool_help.txt"] = "bash -lc 'for c in " + " ".join(ONLOAD_TOOLS) + "; do if command -v \"$c\" >/dev/null 2>&1; then echo \"===== $c =====\"; \"$c\" --help 2>&1 | head -n 40; fi; done'"
+        vendor_cmds["onload_stackdump.txt"] = "onload_stackdump 2>&1 || true"
+        vendor_cmds["onload_info.txt"] = "onload_info 2>&1 || true"
+    for name, cmd in vendor_cmds.items():
+        write(sample_dir / name, f"### CMD: {cmd}\n### TS: {datetime.now().isoformat()}\n\n" + run(cmd))
+
+def collect(sample_dir: Path, iface: str, pid, port, group, src_ip, do_tcpdump: bool, tcpdump_count: int, rx_path: str):
     cmds = {
         "date.txt": "date -Is",
         "uptime.txt": "uptime",
         "driver_info.txt": f"ethtool -i {shlex.quote(iface)} || true",
         "lspci_vendor.txt": "lspci -nn | egrep -i 'solarflare|xilinx|onload|exanic|exablaze|ethernet' || true",
+        "lspci_verbose.txt": "lspci -vv | egrep -A20 -i 'solarflare|xilinx|onload|exanic|exablaze|ethernet' || true",
+        "numa_hardware.txt": "numactl --hardware 2>&1 || true",
+        "numa_cpu_map.txt": "lscpu -e=cpu,node,socket,core 2>&1 || true",
+        "irqbalance_status.txt": "systemctl status irqbalance 2>&1 || true",
         "ip_link.txt": f"ip -s link show dev {shlex.quote(iface)}",
         "ethtool_stats.txt": f"ethtool -S {shlex.quote(iface)}",
         "ethtool_ring.txt": f"ethtool -g {shlex.quote(iface)}",
@@ -66,6 +88,7 @@ def collect(sample_dir: Path, iface: str, pid, port, group, src_ip, do_tcpdump: 
         "ip_maddr.txt": f"ip maddr show dev {shlex.quote(iface)} || true",
         "top_head.txt": "top -b -n 1 | head -n 40 || true",
         "proc_cmdline.txt": "cat /proc/cmdline || true",
+        "numa_proc_maps.txt": f"numastat -p {pid} 2>&1 || true" if pid is not None else "echo 'no pid selected'",
     }
     if port is not None:
         cmds["ss_udp_port.txt"] = f"ss -uapni | grep -E '[:.]{port}\\b|:{port} ' || true"
@@ -81,6 +104,7 @@ def collect(sample_dir: Path, iface: str, pid, port, group, src_ip, do_tcpdump: 
         cmds["process_threads.txt"] = f"ps -eLo pid,tid,psr,pcpu,stat,comm | awk '$1 == {pid}' || true"
         cmds["process_pidstat_cpu.txt"] = f"pidstat -u -w -t -p {pid} 1 3 || true"
         cmds["process_pidstat_mem.txt"] = f"pidstat -r -p {pid} 1 3 || true"
+        cmds["process_status.txt"] = f"cat /proc/{pid}/status || true"
     if do_tcpdump:
         filt = "udp"
         if group:
@@ -92,6 +116,7 @@ def collect(sample_dir: Path, iface: str, pid, port, group, src_ip, do_tcpdump: 
         cmds["tcpdump_snapshot.txt"] = f"tcpdump -ni {shlex.quote(iface)} -c {int(tcpdump_count)} {filt} 2>&1 || true"
     for name, cmd in cmds.items():
         write(sample_dir / name, f"### CMD: {cmd}\n### TS: {datetime.now().isoformat()}\n\n" + run(cmd))
+    collect_vendor_tools(sample_dir, rx_path, iface, do_tcpdump, tcpdump_count)
 
 def parse_udp(text: str):
     low = text.lower()
@@ -310,7 +335,7 @@ def analyze(outdir: Path, iface: str, pid, port, group, src_ip, interval: int, b
         findings.append(f"Process affinity list from taskset: {taskset}")
         steps.append("Use taskset as runtime verification even with isolcpus; isolcpus reduces scheduler noise but does not prove the process/threads are affined to the intended CPU set.")
         if isolated_threads:
-            iso_cpus = sorted({t["psr"] for t in isolated_threads})
+            iso_cpus = sorted({t['psr'] for t in isolated_threads})
             if intr_cpus and iso_cpus and not any(cpu in intr_cpus for cpu in iso_cpus):
                 findings.append(f"NIC interrupts appear busiest on CPU(s) {intr_cpus}, while isolated receiver thread CPU(s) are {iso_cpus}")
                 causes.append(("IRQ / receiver CPU misalignment", 80))
@@ -330,16 +355,12 @@ def analyze(outdir: Path, iface: str, pid, port, group, src_ip, interval: int, b
                 significance.append(f"{key} is {ratio:.1f}x above the last baseline rate")
             elif current > 0 and ratio <= 0.2:
                 significance.append(f"{key} is below the last baseline rate ({current:.2f}/s vs {base:.2f}/s)")
-    if not findings:
-        findings.append("No decisive host-side counters moved during the sampling window")
-        causes.append(("application-level parsing, sequencing, queue handoff, or upstream issue outside the host", 70))
-        steps.append("Correlate application sequence gaps with packet capture and app-level timing/queue metrics.")
     dedup = {}
     for c, s in causes:
         dedup[c] = max(dedup.get(c, 0), s)
     causes_sorted = sorted(dedup.items(), key=lambda x: x[1], reverse=True)
     lines = []
-    lines.append("UDP Drop Diagnostic Summary v4")
+    lines.append("UDP Drop Diagnostic Summary v5")
     lines.append(f"Generated: {datetime.now().isoformat()}")
     lines.append(f"Interface: {iface}")
     if pid is not None: lines.append(f"PID: {pid}")
@@ -383,10 +404,10 @@ def analyze(outdir: Path, iface: str, pid, port, group, src_ip, interval: int, b
                 "isolated_threads": isolated_threads, "interrupt_cpu_candidates": intr_cpus, "sysctls": sysctls,
                 "matching_socket_lines": matching_socket_lines, "baseline_significance": significance,
                 "driver": driver, "rx_path": rx_path, "next_steps": list(seen)}
-    return "\n".join(lines) + "\n", analysis
+    return "\\n".join(lines) + "\\n", analysis
 
 def main():
-    ap = argparse.ArgumentParser(description="UDP drop diagnostic collector + interpreter v4")
+    ap = argparse.ArgumentParser(description="UDP drop diagnostic collector + interpreter v5")
     ap.add_argument("-i", "--iface", required=True)
     ap.add_argument("-p", "--pid", type=int)
     ap.add_argument("-n", "--name")
@@ -410,7 +431,7 @@ def main():
     pid = resolve_pid(args.name, args.pid)
     driver = detect_driver(args.iface)
     rx_path = infer_rx_path(args.iface, args.rx_path, driver)
-    outdir = Path(args.outdir or f"./udp_drop_diag_v4_{ts()}").resolve()
+    outdir = Path(args.outdir or f"./udp_drop_diag_v5_{ts()}").resolve()
     outdir.mkdir(parents=True, exist_ok=True)
 
     print(f"[+] Output directory: {outdir}")
@@ -422,11 +443,11 @@ def main():
         print(f"[!] No PID found for process pattern: {args.name}")
 
     print("[+] Collecting sample1...")
-    collect(outdir / "sample1", args.iface, pid, args.port, args.group, args.src_ip, args.tcpdump, args.tcpdump_count)
+    collect(outdir / "sample1", args.iface, pid, args.port, args.group, args.src_ip, args.tcpdump, args.tcpdump_count, rx_path)
     print(f"[+] Sleeping {args.interval}s...")
     time.sleep(args.interval)
     print("[+] Collecting sample2...")
-    collect(outdir / "sample2", args.iface, pid, args.port, args.group, args.src_ip, args.tcpdump, args.tcpdump_count)
+    collect(outdir / "sample2", args.iface, pid, args.port, args.group, args.src_ip, args.tcpdump, args.tcpdump_count, rx_path)
 
     baseline_path = Path(args.baseline_file).resolve() if args.baseline_file else None
     baseline = load_baseline(baseline_path)
