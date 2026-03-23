@@ -6,7 +6,9 @@ from pathlib import Path
 
 DEFAULT_ISOLATED_THREAD_REGEX = r"udp_recv"
 EXANIC_TOOLS = ["exanic-config","exanic-capture","exanic-clock-sync","exanic-experf","exanic-fwupdate","exanic-fwversion","exanic-port-config"]
-ONLOAD_TOOLS = ["onload_stackdump","onload_tool","onload_info","onload_tcpdump"]
+
+def log(msg: str) -> None:
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
 
 def run(cmd: str) -> str:
     try:
@@ -47,90 +49,58 @@ def infer_rx_path(iface: str, requested: str, driver: str) -> str:
         return "onload"
     return "kernel"
 
-def collect_vendor_tools(sample_dir: Path, rx_path: str, iface: str, do_tcpdump: bool, tcpdump_count: int):
-    vendor_cmds = {}
+def collect_vendor_tools(sample_dir: Path, rx_path: str, iface: str, do_capture: bool, capture_count: int, pid):
+    cmds = {}
     if rx_path == "exanic":
-        vendor_cmds["exanic_tools_present.txt"] = "bash -lc 'for c in " + " ".join(EXANIC_TOOLS) + "; do printf \"%s: \" \"$c\"; command -v \"$c\" || true; done'"
-        vendor_cmds["exanic_config.txt"] = "exanic-config 2>&1 || true"
-        vendor_cmds["exanic_tool_help.txt"] = "bash -lc 'for c in " + " ".join(EXANIC_TOOLS) + "; do if command -v \"$c\" >/dev/null 2>&1; then echo \"===== $c =====\"; \"$c\" --help 2>&1 | head -n 40; fi; done'"
-        if do_tcpdump:
-            vendor_cmds["exanic_capture_snapshot.txt"] = f"bash -lc 'if command -v exanic-capture >/dev/null 2>&1; then exanic-capture {shlex.quote(iface)} 2>&1 | head -n {int(tcpdump_count)}; else echo exanic-capture not found; fi'"
-    if rx_path == "onload":
-        vendor_cmds["onload_tools_present.txt"] = "bash -lc 'for c in " + " ".join(ONLOAD_TOOLS) + "; do printf \"%s: \" \"$c\"; command -v \"$c\" || true; done'"
-        vendor_cmds["onload_tool_help.txt"] = "bash -lc 'for c in " + " ".join(ONLOAD_TOOLS) + "; do if command -v \"$c\" >/dev/null 2>&1; then echo \"===== $c =====\"; \"$c\" --help 2>&1 | head -n 40; fi; done'"
-        vendor_cmds["onload_stackdump.txt"] = "onload_stackdump 2>&1 || true"
-        vendor_cmds["onload_info.txt"] = "onload_info 2>&1 || true"
-    for name, cmd in vendor_cmds.items():
+        cmds["exanic_tools_present.txt"] = "bash -lc 'for c in " + " ".join(EXANIC_TOOLS) + "; do printf \"%s: \" \"$c\"; command -v \"$c\" || true; done'"
+        cmds["exanic_config.txt"] = "exanic-config 2>&1 || true"
+        if pid is not None:
+            cmds["exanic_pid_lsof.txt"] = f"lsof -p {pid} 2>/dev/null | egrep -i 'exanic|/dev/' || true"
+        if do_capture:
+            cmds["exanic_capture_snapshot.txt"] = f"bash -lc 'if command -v exanic-capture >/dev/null 2>&1; then exanic-capture {shlex.quote(iface)} 2>&1 | head -n {int(capture_count)}; else echo exanic-capture not found; fi'"
+    for name, cmd in cmds.items():
+        log(f"Collecting vendor probe: {name}")
         write(sample_dir / name, f"### CMD: {cmd}\n### TS: {datetime.now().isoformat()}\n\n" + run(cmd))
 
-def collect(sample_dir: Path, iface: str, pid, port, group, src_ip, do_tcpdump: bool, tcpdump_count: int, rx_path: str):
+def collect(sample_dir: Path, iface: str, pid, port, group, src_ip, do_capture: bool, capture_count: int):
     cmds = {
         "date.txt": "date -Is",
         "uptime.txt": "uptime",
         "driver_info.txt": f"ethtool -i {shlex.quote(iface)} || true",
-        "lspci_vendor.txt": "lspci -nn | egrep -i 'solarflare|xilinx|onload|exanic|exablaze|ethernet' || true",
-        "lspci_verbose.txt": "lspci -vv | egrep -A20 -i 'solarflare|xilinx|onload|exanic|exablaze|ethernet' || true",
-        "numa_hardware.txt": "numactl --hardware 2>&1 || true",
-        "numa_cpu_map.txt": "lscpu -e=cpu,node,socket,core 2>&1 || true",
-        "irqbalance_status.txt": "systemctl status irqbalance 2>&1 || true",
         "ip_link.txt": f"ip -s link show dev {shlex.quote(iface)}",
         "ethtool_stats.txt": f"ethtool -S {shlex.quote(iface)}",
         "ethtool_ring.txt": f"ethtool -g {shlex.quote(iface)}",
-        "ethtool_channels.txt": f"ethtool -l {shlex.quote(iface)}",
-        "ethtool_coalesce.txt": f"ethtool -c {shlex.quote(iface)}",
-        "interrupts_iface.txt": f"grep -iE '{re.escape(iface)}|mlx|ixgbe|i40e|ice|ena|virtio|igb|e1000|sfc|exanic' /proc/interrupts || true",
+        "interrupts_iface.txt": f"grep -iE '{re.escape(iface)}|exanic|sfc|ixgbe|i40e|ice|ena|mlx|virtio' /proc/interrupts || true",
         "netstat_su.txt": "netstat -su || true",
         "ss_udp_summary.txt": "ss -u -s || true",
         "softnet_stat.txt": "cat /proc/net/softnet_stat || true",
         "sysctl_sockbuf.txt": "sysctl net.core.rmem_default net.core.rmem_max net.core.netdev_max_backlog net.ipv4.udp_mem net.ipv4.udp_rmem_min 2>&1 || true",
-        "mpstat_all.txt": "mpstat -P ALL 1 3 || true",
-        "vmstat.txt": "vmstat 1 3 || true",
-        "ip_maddr.txt": f"ip maddr show dev {shlex.quote(iface)} || true",
-        "top_head.txt": "top -b -n 1 | head -n 40 || true",
-        "proc_cmdline.txt": "cat /proc/cmdline || true",
-        "numa_proc_maps.txt": f"numastat -p {pid} 2>&1 || true" if pid is not None else "echo 'no pid selected'",
     }
     if port is not None:
         cmds["ss_udp_port.txt"] = f"ss -uapni | grep -E '[:.]{port}\\b|:{port} ' || true"
     if group and port is not None:
         cmds["ss_udp_endpoint.txt"] = f"ss -uapni | grep -F '{group}' | grep -E '[:.]{port}\\b|:{port} ' || true"
-    elif group:
-        cmds["ss_udp_group.txt"] = f"ss -uapni | grep -F '{group}' || true"
-    if src_ip:
-        cmds["ss_udp_srcip.txt"] = f"ss -uapni | grep -F '{src_ip}' || true"
     if pid is not None:
         cmds["process_taskset.txt"] = f"taskset -cp {pid} || true"
-        cmds["process_ps.txt"] = f"ps -o pid,ppid,psr,pcpu,pmem,stat,comm,args -p {pid} || true"
         cmds["process_threads.txt"] = f"ps -eLo pid,tid,psr,pcpu,stat,comm | awk '$1 == {pid}' || true"
-        cmds["process_pidstat_cpu.txt"] = f"pidstat -u -w -t -p {pid} 1 3 || true"
-        cmds["process_pidstat_mem.txt"] = f"pidstat -r -p {pid} 1 3 || true"
-        cmds["process_status.txt"] = f"cat /proc/{pid}/status || true"
-    if do_tcpdump:
-        filt = "udp"
-        if group:
-            filt += f" and host {shlex.quote(group)}"
-        if src_ip:
-            filt += f" and host {shlex.quote(src_ip)}"
-        if port is not None:
-            filt += f" and port {int(port)}"
-        cmds["tcpdump_snapshot.txt"] = f"tcpdump -ni {shlex.quote(iface)} -c {int(tcpdump_count)} {filt} 2>&1 || true"
     for name, cmd in cmds.items():
+        log(f"Collecting {name}")
         write(sample_dir / name, f"### CMD: {cmd}\n### TS: {datetime.now().isoformat()}\n\n" + run(cmd))
-    collect_vendor_tools(sample_dir, rx_path, iface, do_tcpdump, tcpdump_count)
 
 def parse_udp(text: str):
     low = text.lower()
-    def get(patterns):
+    def get(pats):
         for line in low.splitlines():
-            for p in patterns:
+            for p in pats:
                 if p in line:
                     m = re.search(r"(\d+)", line)
                     if m:
                         return int(m.group(1))
         return 0
-    return {"receive_buffer_errors": get(["receive buffer errors", "rcvbuferrors"]),
-            "packet_receive_errors": get(["packet receive errors"]),
-            "unknown_port": get(["packets to unknown port received"])}
+    return {
+        "receive_buffer_errors": get(["receive buffer errors", "rcvbuferrors"]),
+        "packet_receive_errors": get(["packet receive errors"]),
+    }
 
 def parse_softnet(text: str):
     total = 0
@@ -158,16 +128,14 @@ def parse_ip_link(text: str):
 
 def parse_ethtool(text: str):
     stats = {}
-    keys = ["rx_dropped","rx_missed_errors","rx_no_buffer_count","rx_errors","rx_missed","rx_discards","alloc_rx_page_failed","alloc_rx_buff_failed","rx_out_of_buffer"]
     for line in text.splitlines():
-        if ":" not in line:
-            continue
-        n, v = line.split(":", 1)
-        n = n.strip(); v = v.strip()
-        if any(k in n for k in keys):
-            m = re.search(r"(-?\d+)$", v)
-            if m:
-                stats[n] = int(m.group(1))
+        if ":" in line:
+            n, v = line.split(":", 1)
+            n = n.strip(); v = v.strip()
+            if any(k in n for k in ["rx_dropped","rx_missed_errors","rx_no_buffer_count","rx_errors","rx_missed","rx_discards"]):
+                m = re.search(r"(-?\d+)$", v)
+                if m:
+                    stats[n] = int(m.group(1))
     return stats
 
 def parse_taskset(text: str):
@@ -181,7 +149,7 @@ def parse_threads(text: str):
             parts = line.split()
             if len(parts) >= 6:
                 try:
-                    threads.append({"pid": int(parts[0]), "tid": int(parts[1]), "psr": int(parts[2]), "pcpu": float(parts[3]), "stat": parts[4], "comm": parts[5]})
+                    threads.append({"tid": int(parts[1]), "psr": int(parts[2]), "comm": parts[5]})
                 except Exception:
                     pass
     return threads
@@ -200,20 +168,10 @@ def parse_interrupt_cpus(text: str):
                 break
         if counts:
             mx = max(counts)
-            if mx > 0:
-                for idx, val in enumerate(counts):
-                    if val == mx:
-                        out.add(idx)
+            for idx, val in enumerate(counts):
+                if val == mx and mx > 0:
+                    out.add(idx)
     return sorted(out)
-
-def parse_sysctl(text: str):
-    vals = {}
-    for line in text.splitlines():
-        if "=" in line:
-            k, v = line.split("=", 1)
-            k = k.strip(); v = v.strip()
-            vals[k] = int(v) if re.match(r"^-?\d+$", v) else None
-    return vals
 
 def parse_ss_lines(text: str):
     return len([l for l in text.splitlines() if l.strip() and not l.startswith("###")])
@@ -221,6 +179,24 @@ def parse_ss_lines(text: str):
 def delta(a, b):
     keys = set(a) | set(b)
     return {k: b.get(k, 0) - a.get(k, 0) for k in keys}
+
+def parse_exanic_validation(sample_dir: Path):
+    result = {"tools_present": [], "capture_used": False, "app_uses_exanic": False}
+    p = sample_dir / "exanic_tools_present.txt"
+    if p.exists():
+        txt = p.read_text(errors="replace")
+        for line in txt.splitlines():
+            if ":" in line:
+                name, val = line.split(":", 1)
+                if val.strip():
+                    result["tools_present"].append(name.strip())
+    result["capture_used"] = (sample_dir / "exanic_capture_snapshot.txt").exists()
+    p = sample_dir / "exanic_pid_lsof.txt"
+    if p.exists():
+        txt = p.read_text(errors="replace").lower()
+        if "exanic" in txt or "/dev/" in txt:
+            result["app_uses_exanic"] = True
+    return result
 
 def load_baseline(path: Path | None):
     if not path or not path.exists():
@@ -233,13 +209,12 @@ def load_baseline(path: Path | None):
 def save_baseline(path: Path | None, record):
     if not path:
         return
+    data = {"runs": []}
     if path.exists():
         try:
             data = json.loads(path.read_text())
         except Exception:
-            data = {"runs": []}
-    else:
-        data = {"runs": []}
+            pass
     data.setdefault("runs", []).append(record)
     data["last"] = record
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -250,6 +225,106 @@ def get_baseline_rate(baseline, key):
         return float(baseline["last"]["rates"][key])
     except Exception:
         return None
+
+def analyze(outdir: Path, iface: str, pid, interval: int, baseline, isolated_thread_regex: str, rx_path: str, driver: str):
+    s1 = outdir / "sample1"; s2 = outdir / "sample2"
+    net1 = parse_udp((s1/"netstat_su.txt").read_text(errors="replace")); net2 = parse_udp((s2/"netstat_su.txt").read_text(errors="replace")); netd = delta(net1, net2)
+    soft1 = parse_softnet((s1/"softnet_stat.txt").read_text(errors="replace")); soft2 = parse_softnet((s2/"softnet_stat.txt").read_text(errors="replace")); softd = soft2 - soft1
+    ip1 = parse_ip_link((s1/"ip_link.txt").read_text(errors="replace")); ip2 = parse_ip_link((s2/"ip_link.txt").read_text(errors="replace")); ipd = delta(ip1, ip2)
+    eth1 = parse_ethtool((s1/"ethtool_stats.txt").read_text(errors="replace")); eth2 = parse_ethtool((s2/"ethtool_stats.txt").read_text(errors="replace")); ethd = delta(eth1, eth2)
+    ethd_pos = {k:v for k,v in ethd.items() if v > 0}
+    taskset = parse_taskset((s1/"process_taskset.txt").read_text(errors="replace")) if pid else None
+    threads = parse_threads((s1/"process_threads.txt").read_text(errors="replace")) if pid else []
+    intr_cpus = parse_interrupt_cpus((s1/"interrupts_iface.txt").read_text(errors="replace"))
+    ss_text = ""
+    for name in ["ss_udp_endpoint.txt","ss_udp_port.txt","ss_udp_summary.txt"]:
+        p = s1 / name
+        if p.exists():
+            ss_text += p.read_text(errors="replace") + "\n"
+    matching_socket_lines = parse_ss_lines(ss_text)
+    rates = {
+        "receive_buffer_errors_per_sec": netd.get("receive_buffer_errors", 0) / max(interval, 1),
+        "packet_receive_errors_per_sec": netd.get("packet_receive_errors", 0) / max(interval, 1),
+        "softnet_drops_per_sec": softd / max(interval, 1),
+        "rx_dropped_per_sec": ipd.get("rx_dropped", 0) / max(interval, 1),
+    }
+    findings, causes, steps, significance = [], [], [], []
+    findings.append(f"Detected driver: {driver or 'unknown'}")
+    findings.append(f"Receive path mode: {rx_path}")
+    if rx_path == "exanic":
+        exv = parse_exanic_validation(s1)
+        findings.append(f"ExaNIC tools present: {', '.join(exv['tools_present']) if exv['tools_present'] else 'none detected'}")
+        findings.append("exanic-capture was used in this run." if exv["capture_used"] else "exanic-capture was NOT used in this run; it is only used when --tcpdump is specified.")
+        findings.append("PID-level validation suggests app uses ExaNIC device paths." if exv["app_uses_exanic"] else "Could not confirm from lsof that app uses ExaNIC device paths.")
+    if matching_socket_lines > 0:
+        findings.append(f"Endpoint/socket filters matched {matching_socket_lines} socket line(s).")
+    else:
+        findings.append("Specified endpoint was not clearly visible in socket inspection output.")
+    isolated_threads = []
+    if threads and isolated_thread_regex:
+        pat = re.compile(isolated_thread_regex)
+        isolated_threads = [t for t in threads if pat.search(t["comm"])]
+        if isolated_threads:
+            desc = ", ".join([f"{t['comm']}[tid={t['tid']}]@CPU{t['psr']}" for t in isolated_threads[:8]])
+            findings.append(f"Threads matching isolation regex '{isolated_thread_regex}': {desc}")
+            iso_cpus = sorted({t["psr"] for t in isolated_threads})
+            if len(iso_cpus) > 1:
+                causes.append(("threads that should be isolated are not staying on one CPU", 85))
+        else:
+            findings.append(f"No threads matched isolation regex '{isolated_thread_regex}'.")
+    if netd.get("receive_buffer_errors", 0) > 0:
+        findings.append(f"UDP receive buffer errors increased by {netd['receive_buffer_errors']} ({rates['receive_buffer_errors_per_sec']:.2f}/s)")
+        causes.append(("socket buffer overflow or application not draining packets fast enough", 95 if rx_path=="kernel" else 70))
+    if softd > 0:
+        findings.append(f"softnet backlog drops increased by {softd} ({rates['softnet_drops_per_sec']:.2f}/s)")
+        causes.append(("softirq/backlog overload under burst traffic", 90 if rx_path=="kernel" else 65))
+    if ethd_pos:
+        findings.append("NIC/driver drop-related counters increased: " + ", ".join([f"{k}={v}" for k,v in sorted(ethd_pos.items())]))
+        causes.append(("NIC ring/driver/hardware receive-side drop before socket layer", 92))
+    if pid and taskset:
+        findings.append(f"Process affinity list from taskset: {taskset}")
+        steps.append("Use taskset as runtime verification even with isolcpus; isolcpus does not prove the process/threads are affined correctly.")
+        if isolated_threads:
+            iso_cpus = sorted({t['psr'] for t in isolated_threads})
+            if intr_cpus and iso_cpus and not any(cpu in intr_cpus for cpu in iso_cpus):
+                findings.append(f"NIC interrupts appear busiest on CPU(s) {intr_cpus}, while isolated receiver thread CPU(s) are {iso_cpus}")
+                causes.append(("IRQ / receiver CPU misalignment", 80))
+    for key, current in rates.items():
+        base = get_baseline_rate(baseline, key)
+        if base is None:
+            significance.append(f"No baseline available yet for {key}")
+        elif base == 0 and current > 0:
+            significance.append(f"{key} is non-zero now but was zero in the last baseline run")
+        elif base > 0:
+            ratio = current / base
+            if ratio >= 5:
+                significance.append(f"{key} is {ratio:.1f}x above the last baseline rate")
+    dedup = {}
+    for c, s in causes:
+        dedup[c] = max(dedup.get(c, 0), s)
+    causes_sorted = sorted(dedup.items(), key=lambda x: x[1], reverse=True)
+    lines = []
+    lines.append("UDP Drop Diagnostic Summary v5.1")
+    lines.append(f"Generated: {datetime.now().isoformat()}")
+    lines.append(f"Interface: {iface}")
+    lines.append(f"Detected driver: {driver or 'unknown'}")
+    lines.append(f"Receive path mode: {rx_path}")
+    lines.append(f"Isolated-thread regex: {isolated_thread_regex}")
+    lines.append("")
+    lines.append("Key findings:")
+    for f in findings: lines.append(f"- {f}")
+    lines.append("")
+    lines.append("Most likely issue(s):")
+    for c, s in causes_sorted[:5]: lines.append(f"- {c} (confidence: {s}%)")
+    lines.append("")
+    lines.append("Baseline significance:")
+    for s in significance: lines.append(f"- {s}")
+    lines.append("")
+    lines.append("Interpretation guidance:")
+    lines.append("- exanic-capture is NOT used automatically for --rx-path exanic; it is only used when --tcpdump is specified.")
+    lines.append("- taskset remains relevant as a runtime verification tool; isolcpus reduces scheduler noise but does not by itself prove the process/threads are affined correctly.")
+    analysis = {"findings": findings, "likely_causes": causes_sorted, "rates": rates, "counter_deltas": {"udp": netd, "softnet_dropped_delta": softd, "ip_link": ipd, "ethtool": ethd_pos}, "driver": driver, "rx_path": rx_path}
+    return "\n".join(lines) + "\n", analysis
 
 def append_csv_history(path: Path | None, row: dict):
     if not path:
@@ -263,151 +338,8 @@ def append_csv_history(path: Path | None, row: dict):
             w.writeheader()
         w.writerow(row)
 
-def analyze(outdir: Path, iface: str, pid, port, group, src_ip, interval: int, baseline, isolated_thread_regex: str, rx_path: str, driver: str):
-    s1 = outdir / "sample1"; s2 = outdir / "sample2"
-    net1 = parse_udp((s1/"netstat_su.txt").read_text(errors="replace")); net2 = parse_udp((s2/"netstat_su.txt").read_text(errors="replace")); netd = delta(net1, net2)
-    soft1 = parse_softnet((s1/"softnet_stat.txt").read_text(errors="replace")); soft2 = parse_softnet((s2/"softnet_stat.txt").read_text(errors="replace")); softd = soft2 - soft1
-    ip1 = parse_ip_link((s1/"ip_link.txt").read_text(errors="replace")); ip2 = parse_ip_link((s2/"ip_link.txt").read_text(errors="replace")); ipd = delta(ip1, ip2)
-    eth1 = parse_ethtool((s1/"ethtool_stats.txt").read_text(errors="replace")); eth2 = parse_ethtool((s2/"ethtool_stats.txt").read_text(errors="replace")); ethd = delta(eth1, eth2)
-    ethd_pos = {k:v for k,v in ethd.items() if v > 0}
-    sysctls = parse_sysctl((s1/"sysctl_sockbuf.txt").read_text(errors="replace"))
-    taskset = parse_taskset((s1/"process_taskset.txt").read_text(errors="replace")) if pid else None
-    threads = parse_threads((s1/"process_threads.txt").read_text(errors="replace")) if pid else []
-    intr_cpus = parse_interrupt_cpus((s1/"interrupts_iface.txt").read_text(errors="replace"))
-    ss_text = ""
-    for name in ["ss_udp_endpoint.txt","ss_udp_group.txt","ss_udp_port.txt","ss_udp_srcip.txt","ss_udp_summary.txt"]:
-        p = s1 / name
-        if p.exists():
-            ss_text += p.read_text(errors="replace") + "\n"
-    matching_socket_lines = parse_ss_lines(ss_text)
-    rates = {"receive_buffer_errors_per_sec": netd.get("receive_buffer_errors", 0) / max(interval, 1),
-             "packet_receive_errors_per_sec": netd.get("packet_receive_errors", 0) / max(interval, 1),
-             "softnet_drops_per_sec": softd / max(interval, 1),
-             "rx_dropped_per_sec": ipd.get("rx_dropped", 0) / max(interval, 1)}
-    findings, causes, steps, significance = [], [], [], []
-    findings.append(f"Detected driver: {driver or 'unknown'}")
-    findings.append(f"Receive path mode: {rx_path}")
-    if rx_path in ("onload","exanic"):
-        findings.append("Kernel UDP and softnet counters are host context, not definitive truth for the bypass fast path.")
-        steps.append("Weight vendor/device counters and app-level sequencing more heavily than generic kernel UDP counters.")
-    else:
-        findings.append("Kernel UDP and softnet counters are considered primary evidence for the receive path.")
-    if matching_socket_lines > 0:
-        findings.append(f"Endpoint/socket filters matched {matching_socket_lines} socket line(s).")
-    else:
-        findings.append("Specified endpoint was not clearly visible in socket inspection output.")
-        steps.append("Verify group/port/process inputs and permissions for socket inspection.")
-    isolated_threads = []
-    if threads and isolated_thread_regex:
-        pat = re.compile(isolated_thread_regex)
-        isolated_threads = [t for t in threads if pat.search(t["comm"])]
-        if isolated_threads:
-            iso_cpus = sorted({t["psr"] for t in isolated_threads})
-            desc = ", ".join([f"{t['comm']}[tid={t['tid']}]@CPU{t['psr']}" for t in isolated_threads[:8]])
-            findings.append(f"Threads matching isolation regex '{isolated_thread_regex}': {desc}")
-            if len(iso_cpus) > 1:
-                findings.append(f"Isolated-thread candidates are spread across multiple CPUs: {iso_cpus}")
-                causes.append(("threads that should be isolated are not staying on one CPU", 85))
-                steps.append("Ensure udp_recv-like threads are pinned/affined to a single intended CPU.")
-        else:
-            findings.append(f"No threads matched isolation regex '{isolated_thread_regex}'.")
-            steps.append("Confirm thread names match the regex or override it with --isolated-thread-regex.")
-    if netd.get("receive_buffer_errors", 0) > 0:
-        findings.append(f"UDP receive buffer errors increased by {netd['receive_buffer_errors']} ({rates['receive_buffer_errors_per_sec']:.2f}/s)")
-        causes.append(("socket buffer overflow or application not draining packets fast enough", 95 if rx_path=="kernel" else 70))
-        steps.append("Inspect receiver-thread work after recv(), including parsing, logging, and queue handoff.")
-        steps.append("Verify SO_RCVBUF and compare against net.core.rmem_max where relevant.")
-    if netd.get("packet_receive_errors", 0) > 0:
-        findings.append(f"Kernel packet receive errors increased by {netd['packet_receive_errors']} ({rates['packet_receive_errors_per_sec']:.2f}/s)")
-        causes.append(("kernel/network receive path issue", 85 if rx_path=="kernel" else 60))
-    if softd > 0:
-        findings.append(f"softnet backlog drops increased by {softd} ({rates['softnet_drops_per_sec']:.2f}/s)")
-        causes.append(("softirq/backlog overload under burst traffic", 90 if rx_path=="kernel" else 65))
-        steps.append("Check IRQ placement, softirq load, and net.core.netdev_max_backlog.")
-    if ethd_pos:
-        findings.append("NIC/driver drop-related counters increased: " + ", ".join([f"{k}={v}" for k,v in sorted(ethd_pos.items())]))
-        causes.append(("NIC ring/driver/hardware receive-side drop before socket layer", 92))
-        steps.append("Inspect RX ring sizing and queue distribution; compare to burst size.")
-    if ipd.get("rx_dropped", 0) > 0 or ipd.get("rx_errors", 0) > 0:
-        findings.append(f"Interface RX counters increased: dropped={ipd.get('rx_dropped',0)}, errors={ipd.get('rx_errors',0)}")
-        causes.append(("host/interface dropping packets before userspace", 88))
-    if pid and taskset:
-        findings.append(f"Process affinity list from taskset: {taskset}")
-        steps.append("Use taskset as runtime verification even with isolcpus; isolcpus reduces scheduler noise but does not prove the process/threads are affined to the intended CPU set.")
-        if isolated_threads:
-            iso_cpus = sorted({t['psr'] for t in isolated_threads})
-            if intr_cpus and iso_cpus and not any(cpu in intr_cpus for cpu in iso_cpus):
-                findings.append(f"NIC interrupts appear busiest on CPU(s) {intr_cpus}, while isolated receiver thread CPU(s) are {iso_cpus}")
-                causes.append(("IRQ / receiver CPU misalignment", 80))
-                steps.append("Align IRQ affinity with the receiver CPU or queue model.")
-    if sysctls.get("net.core.rmem_max") is not None and sysctls["net.core.rmem_max"] < 8 * 1024 * 1024:
-        findings.append(f"net.core.rmem_max looks relatively small at {sysctls['net.core.rmem_max']} bytes")
-        causes.append(("system receive buffer cap may be too small for bursty UDP", 60 if rx_path=="kernel" else 40))
-    for key, current in rates.items():
-        base = get_baseline_rate(baseline, key)
-        if base is None:
-            significance.append(f"No baseline available yet for {key}")
-        elif base == 0 and current > 0:
-            significance.append(f"{key} is non-zero now but was zero in the last baseline run")
-        elif base > 0:
-            ratio = current / base
-            if ratio >= 5:
-                significance.append(f"{key} is {ratio:.1f}x above the last baseline rate")
-            elif current > 0 and ratio <= 0.2:
-                significance.append(f"{key} is below the last baseline rate ({current:.2f}/s vs {base:.2f}/s)")
-    dedup = {}
-    for c, s in causes:
-        dedup[c] = max(dedup.get(c, 0), s)
-    causes_sorted = sorted(dedup.items(), key=lambda x: x[1], reverse=True)
-    lines = []
-    lines.append("UDP Drop Diagnostic Summary v5")
-    lines.append(f"Generated: {datetime.now().isoformat()}")
-    lines.append(f"Interface: {iface}")
-    if pid is not None: lines.append(f"PID: {pid}")
-    if group: lines.append(f"Group/Destination IP: {group}")
-    if port is not None: lines.append(f"UDP port: {port}")
-    if src_ip: lines.append(f"Source IP filter: {src_ip}")
-    lines.append(f"Detected driver: {driver or 'unknown'}")
-    lines.append(f"Receive path mode: {rx_path}")
-    lines.append(f"Isolated-thread regex: {isolated_thread_regex}")
-    lines.append("")
-    lines.append("Key findings:")
-    for f in findings: lines.append(f"- {f}")
-    lines.append("")
-    lines.append("Most likely issue(s):")
-    for c, s in causes_sorted[:5]: lines.append(f"- {c} (confidence: {s}%)")
-    lines.append("")
-    lines.append("Rates and deltas:")
-    lines.append(f"- UDP receive buffer errors: {net1.get('receive_buffer_errors',0)} -> {net2.get('receive_buffer_errors',0)} (delta {netd.get('receive_buffer_errors',0)}, {rates['receive_buffer_errors_per_sec']:.2f}/s)")
-    lines.append(f"- UDP packet receive errors: {net1.get('packet_receive_errors',0)} -> {net2.get('packet_receive_errors',0)} (delta {netd.get('packet_receive_errors',0)}, {rates['packet_receive_errors_per_sec']:.2f}/s)")
-    lines.append(f"- softnet dropped sum: {soft1} -> {soft2} (delta {softd}, {rates['softnet_drops_per_sec']:.2f}/s)")
-    lines.append(f"- Interface RX dropped/errors delta: {ipd.get('rx_dropped',0)}/{ipd.get('rx_errors',0)}")
-    if ethd_pos: lines.append("- NIC counter deltas: " + ", ".join([f"{k}={v}" for k,v in sorted(ethd_pos.items())]))
-    lines.append("")
-    lines.append("Baseline significance:")
-    for s in significance: lines.append(f"- {s}")
-    lines.append("")
-    lines.append("Interpretation guidance:")
-    lines.append("- Threads matching the isolation regex are expected to remain isolated; non-matching threads are allowed to float.")
-    lines.append("- For onload/exanic paths, generic kernel UDP counters are supporting context, not definitive evidence of loss in the fast path.")
-    lines.append("- taskset remains relevant as a runtime verification tool; isolcpus reduces scheduler noise but does not by itself prove the process/threads are affined correctly.")
-    lines.append("")
-    lines.append("Recommended next steps:")
-    seen = set()
-    for step in steps:
-        if step not in seen:
-            lines.append(f"- {step}")
-            seen.add(step)
-    analysis = {"findings": findings, "likely_causes": causes_sorted, "rates": rates,
-                "counter_deltas": {"udp": netd, "softnet_dropped_delta": softd, "ip_link": ipd, "ethtool": ethd_pos},
-                "process_affinity": taskset, "threads": threads, "isolated_thread_regex": isolated_thread_regex,
-                "isolated_threads": isolated_threads, "interrupt_cpu_candidates": intr_cpus, "sysctls": sysctls,
-                "matching_socket_lines": matching_socket_lines, "baseline_significance": significance,
-                "driver": driver, "rx_path": rx_path, "next_steps": list(seen)}
-    return "\\n".join(lines) + "\\n", analysis
-
 def main():
-    ap = argparse.ArgumentParser(description="UDP drop diagnostic collector + interpreter v5")
+    ap = argparse.ArgumentParser(description="UDP drop diagnostic collector + interpreter v5.1")
     ap.add_argument("-i", "--iface", required=True)
     ap.add_argument("-p", "--pid", type=int)
     ap.add_argument("-n", "--name")
@@ -427,53 +359,38 @@ def main():
     if not Path(f"/sys/class/net/{args.iface}").exists():
         print(f"ERROR: interface {args.iface!r} not found", file=sys.stderr)
         return 1
-
     pid = resolve_pid(args.name, args.pid)
     driver = detect_driver(args.iface)
     rx_path = infer_rx_path(args.iface, args.rx_path, driver)
-    outdir = Path(args.outdir or f"./udp_drop_diag_v5_{ts()}").resolve()
+    outdir = Path(args.outdir or f"./udp_drop_diag_v5_1_{ts()}").resolve()
     outdir.mkdir(parents=True, exist_ok=True)
 
-    print(f"[+] Output directory: {outdir}")
-    print(f"[+] Detected driver: {driver or 'unknown'}")
-    print(f"[+] Receive path mode: {rx_path}")
+    log(f"Output directory: {outdir}")
+    log(f"Detected driver: {driver or 'unknown'}")
+    log(f"Receive path mode: {rx_path}")
     if pid is not None:
-        print(f"[+] Using PID: {pid}")
-    elif args.name:
-        print(f"[!] No PID found for process pattern: {args.name}")
-
-    print("[+] Collecting sample1...")
-    collect(outdir / "sample1", args.iface, pid, args.port, args.group, args.src_ip, args.tcpdump, args.tcpdump_count, rx_path)
-    print(f"[+] Sleeping {args.interval}s...")
+        log(f"Using PID: {pid}")
+    if rx_path == "exanic":
+        log("For exanic mode, exanic-capture is only invoked when --tcpdump is specified.")
+    collect(outdir / "sample1", args.iface, pid, args.port, args.group, args.src_ip, args.tcpdump, args.tcpdump_count)
+    log(f"Sleeping {args.interval}s")
     time.sleep(args.interval)
-    print("[+] Collecting sample2...")
-    collect(outdir / "sample2", args.iface, pid, args.port, args.group, args.src_ip, args.tcpdump, args.tcpdump_count, rx_path)
+    collect(outdir / "sample2", args.iface, pid, args.port, args.group, args.src_ip, args.tcpdump, args.tcpdump_count)
 
     baseline_path = Path(args.baseline_file).resolve() if args.baseline_file else None
     baseline = load_baseline(baseline_path)
-    summary, analysis = analyze(outdir, args.iface, pid, args.port, args.group, args.src_ip, args.interval, baseline, args.isolated_thread_regex, rx_path, driver)
-
+    summary, analysis = analyze(outdir, args.iface, pid, args.interval, baseline, args.isolated_thread_regex, rx_path, driver)
     write(outdir / "SUMMARY.txt", summary)
     write(outdir / "analysis.json", json.dumps(analysis, indent=2))
 
-    record = {"ts": datetime.now().isoformat(), "iface": args.iface, "pid": pid, "group": args.group or "",
-              "port": args.port if args.port is not None else "", "src_ip": args.src_ip or "",
-              "driver": driver, "rx_path": rx_path, "rates": analysis["rates"], "counter_deltas": analysis["counter_deltas"]}
+    record = {"ts": datetime.now().isoformat(), "iface": args.iface, "pid": pid, "driver": driver, "rx_path": rx_path, "rates": analysis["rates"], "counter_deltas": analysis["counter_deltas"]}
     save_baseline(baseline_path, record)
 
     csv_path = Path(args.csv_history).resolve() if args.csv_history else None
-    append_csv_history(csv_path, {"ts": record["ts"], "iface": args.iface, "pid": pid or "", "group": args.group or "",
-                                  "port": args.port if args.port is not None else "", "src_ip": args.src_ip or "",
-                                  "driver": driver, "rx_path": rx_path,
-                                  "receive_buffer_errors_per_sec": analysis["rates"]["receive_buffer_errors_per_sec"],
-                                  "packet_receive_errors_per_sec": analysis["rates"]["packet_receive_errors_per_sec"],
-                                  "softnet_drops_per_sec": analysis["rates"]["softnet_drops_per_sec"],
-                                  "rx_dropped_per_sec": analysis["rates"]["rx_dropped_per_sec"],
-                                  "matching_socket_lines": analysis["matching_socket_lines"]})
+    if csv_path:
+        append_csv_history(csv_path, {"ts": record["ts"], "iface": args.iface, "pid": pid or "", "driver": driver, "rx_path": rx_path, **analysis["rates"]})
 
-    print(f"[+] Summary written to {outdir / 'SUMMARY.txt'}")
-    if baseline_path: print(f"[+] Baseline updated at {baseline_path}")
-    if csv_path: print(f"[+] CSV history appended to {csv_path}")
+    log(f"Summary written to {outdir / 'SUMMARY.txt'}")
     print(summary)
     return 0
 
